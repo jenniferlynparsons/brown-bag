@@ -307,12 +307,6 @@ function linkLabel(url) {
   try { const host = new URL(url).hostname.replace(/^www\./, ''); return LINK_SITES[host] || host; } catch (e) { return 'Link'; }
 }
 
-function htmlAttr(s) { return String(s || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;'); }
-function coverImg(b, width) {
-  return b.cover ? `<img src="${htmlAttr(b.cover)}" alt="${htmlAttr(`Cover of ${b.title}`)}" width="${width}">` : '';
-}
-function plural(n, one, many) { return `${n} ${n === 1 ? one : (many || `${one}s`)}`; }
-const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 
 /** Week number counted from a fixed Monday, for finding runs of consecutive weeks. */
 function weekIndex(d) { return Math.floor((parseLocal(d) - new Date(2000, 0, 3)) / (7 * 86400000)); }
@@ -338,11 +332,134 @@ function noteDetails(content) {
   };
 }
 
-/**
- * Year-end report: every book that got an hour in the year, with covers, verdicts,
- * ideas and chapters, plus how the practice went.
+/* --- year-in-reading report core v1 (shared by In the Margins, Brown Bag, The Stacks and Brainrot) --- */
+/*
+ * Each plugin builds a report object in the year-in-reading/1 shape, then calls
+ * renderReportMarkdown() for the note and JSON.stringify() for the .json file.
+ * The JSON is what the Year in Reading page reads.
+ *
+ * {
+ *   schema: 'year-in-reading/1',
+ *   source: { plugin, name, unit, units },          // unit: 'book' | 'fic' | 'session'
+ *   year: '2026', generated: '2026-12-31', title,
+ *   covers: [{ title, cover }],
+ *   stats: [{ label, value }],                       // "At a glance"
+ *   top: [{ label, name, count, of }],               // "Most read" (heading: topHeading)
+ *   highlights: ['markdown', ...],
+ *   months: { label, values: [12], secondary: { label, values: [12] } | null },
+ *   sections: [{ heading, items: [item] }],
+ *   tables: [{ heading, columns: [...], rows: [[...]] }],
+ * }
+ * item: { title, author, link, linkLabel, cover, date, meta: ['markdown'], fields: [{ label, text }],
+ *         checklist: [{ text, done }], quote, tags: [] }
  */
-function exportYearReport(books, details, year, settings) {
+const REPORT_SCHEMA = 'year-in-reading/1';
+const REPORT_MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+
+function rMd(s) { return String(s == null ? '' : s).replace(/([*_`[\]|])/g, '\\$1'); }
+function rAttr(s) { return String(s || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;'); }
+function rImg(title, cover, width) {
+  return cover ? `<img src="${rAttr(cover)}" alt="${rAttr(`Cover of ${title}`)}" width="${width}">` : '';
+}
+function rPlural(n, one, many) { return `${n} ${n === 1 ? one : (many || `${one}s`)}`; }
+function rNum(n) { return typeof n === 'number' ? n.toLocaleString('en-US') : String(n == null ? '' : n); }
+function rOneLine(s) { return String(s || '').replace(/\s*\n+\s*/g, ' ').trim(); }
+function rDate(d) {
+  if (!/^\d{4}-\d\d-\d\d$/.test(d || '')) return d || '';
+  const [y, m, day] = d.split('-').map(Number);
+  return new Date(y, m - 1, day).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+/** Count values → [{ name, count }] sorted by count, then name. */
+function rRank(values) {
+  const m = new Map();
+  for (const v of values) {
+    if (v == null || v === '') continue;
+    const key = String(v).toLowerCase();
+    if (!m.has(key)) m.set(key, { name: String(v), count: 0 });
+    m.get(key).count++;
+  }
+  return [...m.values()].sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+}
+
+/** The "Most read" row for one dimension: ties share the top spot. */
+function rTop(label, ranked, of) {
+  if (!ranked.length) return null;
+  const best = ranked.filter((x) => x.count === ranked[0].count);
+  if ((ranked[0].count < 2 && of > 1) || best.length > 3) return null; // no clear favorite
+  return { label, name: best.map((x) => x.name).join(', '), count: ranked[0].count, of };
+}
+
+function rMonthCounts(dates) {
+  const out = new Array(12).fill(0);
+  for (const d of dates) { const m = /^\d{4}-(\d\d)/.exec(d || ''); if (m) out[Number(m[1]) - 1]++; }
+  return out;
+}
+
+function newReport(source, year, title) {
+  return {
+    schema: REPORT_SCHEMA, source, year: String(year), generated: (() => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; })(),
+    title, covers: [], stats: [], top: [], highlights: [], months: null, sections: [], tables: [],
+  };
+}
+
+function renderReportMarkdown(r) {
+  const out = [`# ${r.title}`, '', `*Made ${rDate(r.generated)} from ${r.source.name}.*`, ''];
+  const itemCount = r.sections.reduce((n, s) => n + s.items.length, 0);
+  if (!itemCount && !r.stats.length) { out.push(`Nothing logged in ${r.year}.`, ''); return out.join('\n'); }
+  const covers = r.covers.filter((c) => c.cover);
+  if (covers.length) out.push(covers.map((c) => rImg(c.title, c.cover, 72)).join(' '), '');
+
+  if (r.stats.length) {
+    out.push('## At a glance', '', '| | |', '| --- | --- |', ...r.stats.map((s) => `| ${rMd(s.label)} | ${rNum(s.value)} |`), '');
+  }
+  const top = r.top.filter(Boolean);
+  if (top.length) {
+    out.push(`## ${r.topHeading || 'Most read'}`, '', `| | Top | ${r.source.units[0].toUpperCase()}${r.source.units.slice(1)} |`, '| --- | --- | --- |',
+      ...top.map((t) => `| ${rMd(t.label)} | ${rMd(t.name)} | ${t.count} of ${t.of} |`), '');
+  }
+  if (r.highlights.length) out.push('## Highlights', '', ...r.highlights.map((h) => `- ${h}`), '');
+
+  if (r.months && r.months.values.some(Boolean)) {
+    const v = r.months.values, sec = r.months.secondary;
+    const max = Math.max(...v);
+    out.push('## Month by month', '', '```');
+    REPORT_MONTHS.forEach((m, i) => {
+      const bar = v[i] ? '█'.repeat(Math.max(1, Math.round((v[i] / max) * 24))) : '';
+      const extra = sec && sec.values[i] ? `  ${rNum(sec.values[i])} ${sec.label}` : '';
+      out.push(`${m.slice(0, 3)}  ${bar.padEnd(25)}${v[i] || ''}${extra}`.trimEnd());
+    });
+    out.push('```', `*${r.months.label}${sec ? `, with ${sec.label}` : ''}.*`, '');
+  }
+
+  for (const s of r.sections) {
+    if (!s.items.length) continue;
+    out.push(`## ${s.heading}`, '');
+    for (const it of s.items) {
+      out.push(`### ${rMd(it.title)}`, '');
+      if (it.cover) out.push(rImg(it.title, it.cover, 120), '');
+      const meta = [...(it.author ? [`*${rMd(it.author)}*`] : []), ...(it.meta || [])];
+      if (it.link) meta.push(`[${it.linkLabel || 'Link'}](${it.link})`);
+      if (meta.length) out.push(meta.join(' · '), '');
+      for (const f of it.fields || []) if (f.text) out.push(`**${f.label}:** ${rOneLine(f.text)}`, '');
+      if (it.checklist && it.checklist.length) out.push(...it.checklist.map((c) => `- [${c.done ? 'x' : ' '}] ${c.text}`), '');
+      if (it.quote) out.push(String(it.quote).trim().split('\n').map((l) => (l ? `> ${l}` : '>')).join('\n'), '');
+    }
+  }
+  for (const t of r.tables) {
+    if (!t.rows.length) continue;
+    out.push(`## ${t.heading}`, '', `| ${t.columns.join(' | ')} |`, `| ${t.columns.map(() => '---').join(' | ')} |`,
+      ...t.rows.map((row) => `| ${row.map((c) => rMd(rNum(c))).join(' | ')} |`), '');
+  }
+  return out.join('\n');
+}
+/* --- end report core --- */
+
+/**
+ * Year-end report data (year-in-reading/1): every book that got an hour in the year,
+ * with verdicts, ideas and chapters, plus how the practice went.
+ */
+function buildYearReport(books, details, year, settings) {
   const y = String(year);
   const inYear = (d) => d && d.startsWith(`${y}-`);
   details = details || {};
@@ -351,80 +468,61 @@ function exportYearReport(books, details, year, settings) {
   log.sort((a, b) => a.d.localeCompare(b.d) || byTitle(a.b, b.b));
   const seen = [...new Set(log.map((e) => e.b))];
   const hourMin = (settings && settings.phases ? settings.phases : DEFAULT_PHASES).reduce((n, p) => n + p.minutes, 0);
-  const out = [`# ${y} in Brown Bag`, '', `*Made ${niceDate(todayStr())}.*`, ''];
-  if (!log.length) { out.push(`No sessions logged in ${y}.`, ''); return out.join('\n'); }
+  const r = newReport({ plugin: 'brown-bag', name: 'Brown Bag', unit: 'book', units: 'books' }, y, `${y} in Brown Bag`);
+  r.topHeading = 'Most common';
+  if (!log.length) return r;
 
-  const covers = seen.filter((b) => b.cover);
-  if (covers.length) out.push(covers.map((b) => coverImg(b, 72)).join(' '), '');
-
-  // At a glance
+  r.covers = seen.filter((b) => b.cover).map((b) => ({ title: b.title, cover: b.cover }));
   const verdictCount = Object.fromEntries(VERDICTS.map(([v]) => [v, seen.filter((b) => b.verdict === v).length]));
   const allCh = seen.flatMap((b) => (details[b.path] ? details[b.path].chapters : []));
   const chDone = allCh.filter((c) => c.done).length;
-  out.push('## At a glance', '', '| | |', '| --- | --- |',
-    `| Sessions | ${log.length} |`,
-    `| Time spent | about ${plural(Math.round((log.length * hourMin) / 60), 'hour')} |`,
-    `| Books | ${seen.length} |`);
-  for (const [v, label] of VERDICTS) if (verdictCount[v]) out.push(`| ${label} | ${verdictCount[v]} |`);
+  r.stats.push({ label: 'Sessions', value: log.length }, { label: 'Time spent', value: `about ${rPlural(Math.round((log.length * hourMin) / 60), 'hour')}` },
+    { label: 'Books', value: seen.length });
+  for (const [v, label] of VERDICTS) if (verdictCount[v]) r.stats.push({ label, value: verdictCount[v] });
   const noVerdict = seen.filter((b) => !b.verdict).length;
-  if (noVerdict) out.push(`| No verdict yet | ${noVerdict} |`);
-  if (allCh.length) out.push(`| Chapters marked worth reading | ${allCh.length} (${chDone} read so far) |`);
-  out.push('');
+  if (noVerdict) r.stats.push({ label: 'No verdict yet', value: noVerdict });
+  if (allCh.length) r.stats.push({ label: 'Chapters marked worth reading', value: `${allCh.length} (${chDone} read so far)` });
 
-  // Highlights
-  const hi = [];
+  r.top = [rTop('Topic', rRank(seen.flatMap((b) => b.topics)), seen.length), rTop('Verdict', rRank(seen.map((b) => VERDICT_LABEL[b.verdict])), seen.length),
+    rTop('Author', rRank(seen.map((b) => b.author)), seen.length)].filter(Boolean);
+
+  const hi = r.highlights;
   const streak = longestWeekStreak(log.map((e) => e.d));
   if (streak > 1) hi.push(`**Longest run:** ${streak} weeks in a row with a session.`);
-  const monthCount = MONTH_NAMES.map((_, i) => log.filter((e) => e.d.slice(5, 7) === pad(i + 1)).length);
-  const peak = Math.max(...monthCount);
-  if (peak > 1) hi.push(`**Busiest month:** ${MONTH_NAMES.filter((_, i) => monthCount[i] === peak).join(' and ')}, with ${peak} sessions.`);
+  const months = rMonthCounts(log.map((e) => e.d));
+  const peak = Math.max(...months);
+  if (peak > 1) hi.push(`**Busiest month:** ${REPORT_MONTHS.filter((_, i) => months[i] === peak).join(' and ')}, with ${peak} sessions.`);
   const repeats = seen.filter((b) => b.sessions.filter(inYear).length > 1);
-  if (repeats.length) hi.push(`**Worth a second hour:** ${repeats.map((b) => `*${md(b.title)}*`).join(', ')}.`);
+  if (repeats.length) hi.push(`**Worth a second hour:** ${repeats.map((b) => `*${rMd(b.title)}*`).join(', ')}.`);
   const kept = verdictCount['read deeper'] + verdictCount.reference;
   const decided = seen.filter((b) => b.verdict).length;
   if (decided) hi.push(`**Kept vs. let go:** ${kept} of ${decided} books earned a place (read deeper or reference), and ${verdictCount['let it go']} ${verdictCount['let it go'] === 1 ? 'was' : 'were'} let go.`);
-  const topicCount = new Map();
-  for (const b of seen) for (const t of b.topics) topicCount.set(t, (topicCount.get(t) || 0) + 1);
-  const topTopic = [...topicCount].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0];
-  if (topTopic && topTopic[1] > 1) hi.push(`**Most visited topic:** ${topTopic[0]}, ${plural(topTopic[1], 'book')}.`);
   const sorted = books.filter((b) => b.status === 'skimmed').length;
-  if (books.length) hi.push(`**The library so far:** ${sorted} of ${books.length} books sorted (${Math.round((sorted / books.length) * 100)}%). ${books.length - sorted > 0 ? `At one a week, the rest would take about ${books.length - sorted < 52 ? plural(books.length - sorted, 'more week') : plural(Math.round((books.length - sorted) / 52), 'year')}.` : ''}`);
-  if (hi.length) out.push('## Highlights', '', ...hi.map((h) => `- ${h}`), '');
+  const left = books.length - sorted;
+  if (books.length) hi.push(`**The library so far:** ${sorted} of ${books.length} books sorted (${Math.round((sorted / books.length) * 100)}%).${left > 0 ? ` At one a week, the rest would take about ${left < 52 ? rPlural(left, 'more week') : rPlural(Math.round(left / 52), 'year')}.` : ''}`);
 
-  // Session log
-  out.push('## Every hour', '', '| Date | Book | Verdict |', '| --- | --- | --- |');
-  for (const e of log) out.push(`| ${shortDate(e.d)} | ${md(e.b.title).replace(/\|/g, '\\|')} | ${VERDICT_LABEL[e.b.verdict] || ''} |`);
-  out.push('');
-
-  // Books by verdict
-  const entry = (b) => {
+  r.months = { label: 'Sessions', values: months, secondary: null };
+  const item = (b) => {
     const dt = details[b.path] || {};
     const sess = b.sessions.filter(inYear);
-    const meta = [b.author && `*${md(b.author)}*`, sess.length > 1 ? `${sess.length} sessions: ${sess.map(shortDate).join(', ')}` : shortDate(sess[0]),
-      b.topics.join(', '), b.link && `[${linkLabel(b.link)}](${b.link})`].filter(Boolean);
-    const lines = [`### ${md(b.title)}`, ''];
-    if (b.cover) lines.push(coverImg(b, 120), '');
-    lines.push(meta.join(' · '), '');
-    const one = (s) => s.replace(/\s*\n+\s*/g, ' ');
-    if (dt.why) lines.push(`**Why I picked it up:** ${one(dt.why)}`, '');
-    if (dt.question) lines.push(`**Guiding question:** ${one(dt.question)}`, '');
-    if (dt.firstPass) lines.push(`**What it's arguing:** ${one(dt.firstPass)}`, '');
-    if (b.idea) lines.push(`**The one idea worth keeping:** ${one(b.idea)}`, '');
-    if (dt.applies) lines.push(`**Where it applies:** ${one(dt.applies)}`, '');
-    if (dt.chapters && dt.chapters.length) lines.push('**Chapters worth reading:**', '', ...dt.chapters.map((c) => `- [${c.done ? 'x' : ' '}] ${c.text}`), '');
-    return lines.join('\n');
+    return {
+      title: b.title, author: b.author, cover: b.cover, date: sess[sess.length - 1],
+      link: b.link, linkLabel: b.link ? linkLabel(b.link) : '',
+      meta: [sess.length > 1 ? `${sess.length} sessions: ${sess.map(rDate).join(', ')}` : rDate(sess[0]), b.topics.join(', ')].filter(Boolean),
+      fields: [{ label: 'Why I picked it up', text: dt.why }, { label: 'Guiding question', text: dt.question },
+        { label: "What it's arguing", text: dt.firstPass }, { label: 'The one idea worth keeping', text: b.idea },
+        { label: 'Where it applies', text: dt.applies }].filter((f) => f.text),
+      checklist: (dt.chapters || []).map((c) => ({ text: c.text, done: c.done })),
+      tags: [VERDICT_LABEL[b.verdict] || 'No verdict yet', ...b.topics],
+    };
   };
-  for (const [v, label] of [...VERDICTS, ['', 'No verdict yet']]) {
-    const list = seen.filter((b) => b.verdict === v).sort(byTitle);
-    if (list.length) out.push(`## ${label}`, '', ...list.map(entry));
-  }
-
-  if (topicCount.size) {
-    out.push('## By topic', '', '| Topic | Books |', '| --- | --- |',
-      ...[...topicCount].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([t, n]) => `| ${t} | ${n} |`), '');
-  }
-  return out.join('\n');
+  r.sections = [...VERDICTS, ['', 'No verdict yet']].map(([v, label]) => ({ heading: label, items: seen.filter((b) => b.verdict === v).sort(byTitle).map(item) }));
+  r.tables.push({ heading: 'Every hour', columns: ['Date', 'Book', 'Verdict'], rows: log.map((e) => [rDate(e.d), e.b.title, VERDICT_LABEL[e.b.verdict] || '']) });
+  r.tables.push({ heading: 'By topic', columns: ['Topic', 'Books'], rows: rRank(seen.flatMap((b) => b.topics)).map((t) => [t.name, t.count]) });
+  return r;
 }
+
+function exportYearReport(books, details, year, settings) { return renderReportMarkdown(buildYearReport(books, details, year, settings)); }
 
 /* ------------------------------------------------------------------ */
 /* Plugin                                                             */
@@ -693,7 +791,9 @@ class BrownBagPlugin extends Plugin {
         if (!/^\d{4}$/.test(year)) { new Notice('Enter a four-digit year'); return; }
         const details = {};
         for (const b of books) if (b.sessions.some((d) => d.startsWith(year))) details[b.path] = noteDetails(await this.app.vault.cachedRead(b.file));
-        const f = await this.writeFile(`${folder}/${year} in Brown Bag.md`, exportYearReport(books, details, year, this.settings));
+        const report = buildYearReport(books, details, year, this.settings);
+        const f = await this.writeFile(`${folder}/${year} in Brown Bag.md`, renderReportMarkdown(report));
+        await this.writeFile(`${folder}/${year} in Brown Bag.json`, JSON.stringify(report, null, 2));
         this.openFile(f);
       }).open();
     }
@@ -1530,7 +1630,7 @@ module.exports = BrownBagPlugin;
 module.exports.default = BrownBagPlugin;
 module.exports.helpers = {
   todayStr, toDateStr, stripLink, toList, normStatus, normVerdict, dateList, bookFromFrontmatter,
-  getSection, setSection, getWhy, setWhy, parseChapters, noteDetails, exportYearReport, longestWeekStreak, linkLabel, toggleChapterLine, sessionState, fmtMs, safeFileName,
+  getSection, setSection, getWhy, setWhy, parseChapters, noteDetails, exportYearReport, buildYearReport, renderReportMarkdown, longestWeekStreak, linkLabel, toggleChapterLine, sessionState, fmtMs, safeFileName,
   buildBookNote, buildTopicNote, buildRetroNote, verdictBody, exportSkimNotes, exportChapters,
   exportLibraryMarkdown, exportLibraryCsv, totalSessions, DEFAULT_SETTINGS, DEFAULT_PHASES,
 };
