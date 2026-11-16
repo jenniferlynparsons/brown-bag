@@ -1,0 +1,10 @@
+{
+  "id": "brown-bag",
+  "name": "Brown Bag",
+  "version": "1.1.0",
+  "minAppVersion": "1.6.0",
+  "description": "One book, one hour, once a week: a four-phase skim timer, verdicts, a running list of chapters worth reading, and a year-end report.",
+  "author": "Jennifer Lyn Parsons",
+  "isDesktopOnly": false,
+  "authorUrl": "https://github.com/jenniferlynparsons"
+}
